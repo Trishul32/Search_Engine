@@ -1,0 +1,38 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: raguser
+      POSTGRES_PASSWORD: ragpass
+      POSTGRES_DB: arxiv_rag
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raguser -d arxiv_rag"]
+      interval: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      args: { ML: "true" }
+    environment:
+      DATABASE_URL: postgresql+psycopg2://raguser:ragpass@db:5432/arxiv_rag
+      EMBEDDING_BACKEND: sentence-transformers
+      LLM_BACKEND: extractive          # switch to openai-compatible + Ollama for generative answers
+    volumes: ["appdata:/app/data"]
+    ports: ["8000:8000"]
+    depends_on:
+      db: { condition: service_healthy }
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    environment:
+      API_BASE: http://api:8000/api/v1
+    ports: ["8501:8501"]
+    depends_on: [api]
+
+volumes:
+  pgdata:
+  appdata:

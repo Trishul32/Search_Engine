@@ -1,0 +1,7 @@
+-r requirements.txt
+sentence-transformers>=3.0     # embeddings (all-MiniLM/BGE) + cross-encoder reranker
+transformers>=4.41             # local open-source LLMs (LLaMA/Qwen/Mistral/...)
+torch>=2.2
+accelerate>=0.30
+# For PostgreSQL metadata storage in production:
+psycopg2-binary>=2.9
