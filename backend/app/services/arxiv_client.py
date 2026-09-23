@@ -19,7 +19,7 @@ import logging
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
-import httpx
+import requests
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -136,11 +136,11 @@ def search_arxiv(
     }
     _last_fetch_ts = now
     try:
-        resp = httpx.get(
+        resp = requests.get(
             settings.arxiv_api_url,
             params=params,
             timeout=settings.arxiv_timeout_s,
-            follow_redirects=True,
+            allow_redirects=True,
             headers={"User-Agent": "arxiv-semantic-search/1.0"},
         )
         if resp.status_code in (429, 503):
@@ -155,7 +155,7 @@ def search_arxiv(
         _cache[key] = (now, metas)
         logger.info("arXiv fetch: %d entries for %r", len(metas), query)
         return metas, None
-    except httpx.TimeoutException:
+    except requests.Timeout:
         msg = f"arXiv API timed out after {settings.arxiv_timeout_s:.0f}s"
         logger.warning("%s (query=%r)", msg, query)
         return [], msg

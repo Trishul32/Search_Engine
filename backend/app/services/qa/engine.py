@@ -11,6 +11,7 @@ deduplicated answer across papers with bracketed citations.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 
 from backend.app.core.config import settings
@@ -81,7 +82,37 @@ class QAEngine:
             for _, score, m in hits
         ]
         # chunk-level rerank sharpens the context fed to the LLM
-        return self.reranker.rerank(question, cands, top_k=top_k)
+        ranked = self.reranker.rerank(question, cands, top_k=top_k)
+        if (
+            not ranked
+            or ranked[0].get("rerank_score", 0.0)
+            < settings.qa_relevance_threshold
+        ):
+            logger.info(
+                "No QA evidence above threshold %.3f for question %r "
+                "(top score %.3f)",
+                settings.qa_relevance_threshold,
+                question,
+                ranked[0].get("rerank_score", 0.0) if ranked else 0.0,
+            )
+            return []
+        unique: list[dict] = []
+        seen: set[str] = set()
+        seen_words: list[set[str]] = []
+        for chunk in ranked:
+            key = re.sub(r"\s+", " ", chunk.get("text", "").strip().lower())
+            if not key or key in seen:
+                continue
+            words = set(re.findall(r"[a-z0-9]+", key))
+            if any(
+                len(words & prior) / max(1, len(words | prior)) >= 0.75
+                for prior in seen_words
+            ):
+                continue
+            seen.add(key)
+            seen_words.append(words)
+            unique.append(chunk)
+        return unique
 
     @staticmethod
     def _history_block(history: list[dict] | None) -> str:
@@ -91,6 +122,12 @@ class QAEngine:
         lines = [f"{'User' if t['role'] == 'user' else 'Assistant'}: {t['content']}"
                  for t in turns]
         return "Conversation so far:\n" + "\n".join(lines) + "\n\n"
+
+    def _has_indexed_chunks(self, paper_id: str) -> bool:
+        """Distinguish low-relevance retrieval from missing full text."""
+        return self.chunk_store.contains(
+            lambda meta: meta.get("arxiv_id") == paper_id
+        )
 
     @staticmethod
     def _sources(chunks: list[dict]) -> list[SourceRef]:
@@ -213,7 +250,8 @@ class QAEngine:
                 top_k=settings.map_reduce_per_doc_chunks,
             )
             if not chunks:
-                return pid, None, "no_chunks"
+                reason = "no_match" if self._has_indexed_chunks(pid) else "no_chunks"
+                return pid, None, reason
             ctx_items = [
                 {"label": f"section: {c['section']}", "text": c["text"]}
                 for c in chunks

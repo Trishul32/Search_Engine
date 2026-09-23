@@ -73,6 +73,8 @@ class Reranker:
             return []
         top_k = top_k or settings.rerank_top_k
         if not settings.reranker_enabled:
+            for candidate in candidates:
+                candidate["rerank_score"] = float(candidate.get("fused_score", 0.0))
             return candidates[:top_k]
 
         model = _load_cross_encoder()

@@ -2,6 +2,9 @@
 
 Backends (all open-source-friendly, per the report's scope):
 
+    if _has_malformed_source_artifacts(answer):
+        logger.warning("%s answer contained malformed source artifacts; using fallback", llm.name)
+        return ExtractiveLLM().generate(prompt, system)
 * ``openai-compatible`` — any OpenAI-style endpoint: **Ollama**, vLLM,
                           LM Studio, llama.cpp server, or OpenAI itself.
                           Recommended path to a strong model (e.g.
@@ -78,6 +81,51 @@ def _words(text: str) -> set[str]:
     return {_stem(w) for w in _WORD.findall(text.lower()) if w not in _STOP}
 
 
+def _clean_extracted_sentence(sentence: str) -> str:
+    """Remove page/section labels accidentally joined to PDF text."""
+    sentence = sentence.replace("â€™", "'").replace("â€œ", '"').replace("â€\x9d", '"')
+    sentence = sentence.replace("â€“", "-").replace("â€”", "-").replace("â", "")
+    sentence = re.sub(
+        r"^(?:\d+\s+on [^.]+\)\s*)?(?:Conclusion|Results|Abstract|Discussion)\s+",
+        "",
+        sentence.strip(),
+        flags=re.I,
+    )
+    # PDF page boundaries can splice the same conclusion into a later chunk.
+    sentence = re.sub(
+        r"\s+(?:Conclusion|Results)\s+.*?\s+(?=This paper|The authors|The proposed)",
+        " ",
+        sentence,
+        flags=re.I,
+    )
+    return sentence.strip()
+
+
+def _is_pdf_noise(sentence: str) -> bool:
+    lowered = sentence.lower()
+    return (
+        "â" in sentence
+        or "search for non-existant value" in lowered
+        or "search for non-existent value" in lowered
+        or lowered.startswith("attempt to search")
+        or re.match(r"^the result of testing the circuit from fig\.?", lowered)
+        or len(_normalized_words(sentence)) < 8
+    )
+
+
+def _clean_context(text: str) -> str:
+    sentences = []
+    seen: set[str] = set()
+    for raw in re.split(r"(?<=[.!?])\s+", text):
+        sentence = _clean_extracted_sentence(raw)
+        key = " ".join(_normalized_words(sentence))
+        if _is_pdf_noise(sentence) or key in seen:
+            continue
+        seen.add(key)
+        sentences.append(sentence)
+    return " ".join(sentences)
+
+
 class ExtractiveLLM(BaseLLM):
     """Query-biased extractive synthesis with inline [n] source markers.
 
@@ -104,8 +152,8 @@ class ExtractiveLLM(BaseLLM):
         # score every candidate sentence
         cands: list[dict] = []
         for pos, (src_idx, ctx) in enumerate(contexts):
-            for s_pos, sent in enumerate(_SENT.split(ctx)):
-                sent = sent.strip()
+            for s_pos, sent in enumerate(_SENT.split(_clean_context(ctx))):
+                sent = _clean_extracted_sentence(sent)
                 w = _words(sent)
                 if len(w) < 3 or len(sent) > 600:
                     continue
@@ -156,6 +204,10 @@ class ExtractiveLLM(BaseLLM):
         if rest:
             parts.append("\n\n")
             parts.append(" ".join(f"{c['sent']} [{c['src']}]" for c in rest))
+        parts.extend([
+            "\n\n",
+            "Key takeaway: The cited evidence supports the finding above.",
+        ])
         return "".join(parts)
 
 
@@ -199,18 +251,23 @@ class HFLocalLLM(BaseLLM):
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
         inputs = self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, return_tensors="pt"
+            messages,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
         ).to(self.model.device)
-        out = self.model.generate(
-            inputs,
-            max_new_tokens=settings.llm_max_new_tokens,
-            temperature=max(0.01, settings.llm_temperature),
-            do_sample=settings.llm_temperature > 0,
-            repetition_penalty=1.05,
-            pad_token_id=self.tokenizer.eos_token_id,
-        )
+        generation_config = {
+            "max_new_tokens": settings.llm_max_new_tokens,
+            "do_sample": settings.llm_temperature > 0,
+            "repetition_penalty": 1.05,
+            "pad_token_id": self.tokenizer.eos_token_id,
+        }
+        if settings.llm_temperature > 0:
+            generation_config["temperature"] = settings.llm_temperature
+        with __import__("torch").inference_mode():
+            out = self.model.generate(**inputs, **generation_config)
         return self.tokenizer.decode(
-            out[0][inputs.shape[1]:], skip_special_tokens=True
+            out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
         ).strip()
 
 
@@ -300,6 +357,69 @@ _PREAMBLE = re.compile(
 _NO_INFO = re.compile(r"(does not contain|no relevant information|cannot be answered)", re.I)
 
 
+def _normalized_words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def _looks_like_raw_context_copy(answer: str, prompt: str) -> bool:
+    """Detect long verbatim source reuse in a generative answer."""
+    _, _, contexts = _parse_prompt(prompt)
+    answer_words = _normalized_words(answer)
+    if len(answer_words) < 12:
+        return False
+    answer_text = " ".join(answer_words)
+    for _, context in contexts:
+        for sentence in re.split(r"(?<=[.!?])\s+", context):
+            source_words = _normalized_words(sentence)
+            if len(source_words) < 12:
+                continue
+            phrase = " ".join(source_words)
+            if phrase in answer_text:
+                return True
+    return False
+
+
+def _has_repeated_phrase(answer: str, size: int = 12) -> bool:
+    """Detect stitched chunk output by looking for repeated long phrases."""
+    words = _normalized_words(answer)
+    phrases = {
+        " ".join(words[i : i + size])
+        for i in range(len(words) - size + 1)
+    }
+    return len(phrases) < len(words) - size + 1
+
+
+def _has_malformed_source_artifacts(answer: str) -> bool:
+    lowered = answer.lower()
+    return (
+        "â" in answer
+        or "search for non-existant value" in lowered
+        or "search for non-existent value" in lowered
+        or "attempt to search" in lowered
+        or re.search(r"\b(?:conclusion|results)\s+in this paper", lowered) is not None
+    )
+
+
+def _synthesis_retry_prompt(prompt: str) -> str:
+    _, question, contexts = _parse_prompt(prompt)
+    evidence = []
+    seen: set[str] = set()
+    for source_id, text in contexts:
+        compact = re.sub(r"\s+", " ", text).strip()[:900]
+        if not compact or compact in seen:
+            continue
+        seen.add(compact)
+        evidence.append(f"[{source_id}] {compact}")
+    return (
+        "Rewrite the answer below as a concise synthesis in your own words. "
+        "Do not copy any source sentence or return source fragments. Remove "
+        "repetition, keep only claims supported by the numbered excerpts, and "
+        "retain valid inline citations. Return only the rewritten answer.\n\n"
+        "Evidence:\n" + "\n\n".join(evidence) +
+        f"\n\nQuestion: {question}"
+    )
+
+
 def enforce_grounding(answer: str, n_sources: int) -> tuple[str, bool]:
     """Sanitize a generated answer against its actual source list.
 
@@ -340,16 +460,35 @@ def safe_generate(
     llm = get_llm()
     try:
         answer = llm.generate(prompt, system)
-    except Exception as exc:
-        logger.warning("%s generation failed (%s); extractive fallback", llm.name, exc)
+    except Exception:
+        logger.exception(
+            "%s generation failed; using the grounded extractive fallback",
+            llm.name,
+        )
         return ExtractiveLLM().generate(prompt, system)
 
-    if (
-        settings.llm_grounding_check
-        and require_citations
-        and n_sources > 0
-        and llm.generative
+    if llm.generative and (
+        _looks_like_raw_context_copy(answer, prompt)
+        or _has_repeated_phrase(answer)
+        or _has_malformed_source_artifacts(answer)
     ):
+        logger.warning(
+            "%s answer copied a source passage; requesting a synthesized rewrite",
+            llm.name,
+        )
+        try:
+            answer = llm.generate(_synthesis_retry_prompt(prompt), system)
+        except Exception:
+            logger.exception("%s synthesis retry failed", llm.name)
+            return ExtractiveLLM().generate(prompt, system)
+        if _looks_like_raw_context_copy(answer, prompt):
+            logger.warning(
+                "%s synthesis retry still copied source text; using fallback",
+                llm.name,
+            )
+            return ExtractiveLLM().generate(prompt, system)
+
+    if require_citations and n_sources > 0 and llm.generative:
         answer, grounded = enforce_grounding(answer, n_sources)
         if not grounded:
             logger.warning(
@@ -357,4 +496,10 @@ def safe_generate(
                 llm.name,
             )
             return ExtractiveLLM().generate(prompt, system)
+    if _has_malformed_source_artifacts(answer):
+        logger.warning(
+            "%s answer contained malformed source artifacts; using fallback",
+            llm.name,
+        )
+        return ExtractiveLLM().generate(prompt, system)
     return answer

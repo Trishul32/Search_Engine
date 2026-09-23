@@ -11,7 +11,11 @@ from sqlalchemy import select
 
 from backend.app.db.models import Paper
 from backend.app.db.session import db_session
-from backend.app.services.llm.generator import ExtractiveLLM, enforce_grounding
+from backend.app.services.llm.generator import (
+    ExtractiveLLM,
+    enforce_grounding,
+    safe_generate,
+)
 
 
 def _statuses(ids):
@@ -137,3 +141,63 @@ def test_safe_generate_grounding_guard_regenerates(monkeypatch):
     out = gen.safe_generate(prompt, n_sources=1, require_citations=True)
     assert "scales infinitely" not in out
     assert "[1]" in out, "fallback answer is extractive and cited"
+
+
+def test_safe_generate_rewrites_verbatim_context_copy(monkeypatch):
+    import backend.app.services.llm.generator as gen
+
+    class CopyingLLM(gen.BaseLLM):
+        name = "copying"
+        generative = True
+        calls = 0
+
+        def generate(self, prompt, system=""):
+            self.calls += 1
+            if self.calls == 1:
+                return (
+                    "Hybrid retrieval combines BM25 sparse retrieval with dense "
+                    "embedding retrieval for better search results. [1]"
+                )
+            return "The method combines two complementary retrieval signals. [1]"
+
+    llm = CopyingLLM()
+    monkeypatch.setattr(gen, "get_llm", lambda: llm)
+    prompt = (
+        "[1] section: results\n"
+        "Hybrid retrieval combines BM25 sparse retrieval with dense embedding "
+        "retrieval for better search results.\n\n"
+        "Question: how does the method work?\n"
+    )
+    out = safe_generate(prompt, n_sources=1, require_citations=True)
+    assert out == "The method combines two complementary retrieval signals. [1]"
+    assert llm.calls == 2
+
+
+def test_safe_generate_rewrites_stitched_repeated_fragments(monkeypatch):
+    import backend.app.services.llm.generator as gen
+
+    class StitchingLLM(gen.BaseLLM):
+        name = "stitching"
+        generative = True
+        calls = 0
+
+        def generate(self, prompt, system=""):
+            self.calls += 1
+            if self.calls == 1:
+                return (
+                    "The method was tested on IBM's quantum computer and the "
+                    "results were evaluated. The method was tested on IBM's "
+                    "quantum computer and the results were evaluated. [1]"
+                )
+            return "The experiments evaluated the proposed method on quantum hardware. [1]"
+
+    llm = StitchingLLM()
+    monkeypatch.setattr(gen, "get_llm", lambda: llm)
+    prompt = (
+        "[1] section: conclusion\n"
+        "The method was tested on IBM's quantum computer and the results were evaluated.\n\n"
+        "Question: what were the final results?\n"
+    )
+    out = safe_generate(prompt, n_sources=1, require_citations=True)
+    assert out == "The experiments evaluated the proposed method on quantum hardware. [1]"
+    assert llm.calls == 2

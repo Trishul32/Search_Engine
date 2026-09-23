@@ -79,8 +79,8 @@ with tab_search:
         )
     fetch_live = st.toggle(
         "Fetch fresh papers from arXiv API (real-time)",
-        help="Adds one bounded HTTP call (hard timeout, default 8s) to the arXiv API per search. If it times out or fails, search continues over the local corpus and explains what happened.", value=True,
         help="When off, search runs over the locally indexed corpus only.",
+        value=True,
     )
 
     if submitted and query.strip():

@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     # synchronous call inside /search, and 15 fresh candidates per query
     # accumulate quickly across searches (each also costs an embedding).
     arxiv_max_results: int = 15
-    arxiv_api_url: str = "https://export.arxiv.org/api/query"
+    arxiv_api_url: str = "https://arxiv.org/api/query"
     # Hard cap on the live-fetch HTTP call. Search must never hang on
     # a slow/blocked route to the arXiv API — on timeout it degrades to
     # the local corpus and reports why.
@@ -93,6 +93,10 @@ class Settings(BaseSettings):
     # ----------------------------------------------------------------- QA
     qa_chunk_top_k: int = 8              # chunks fed to the LLM per answer
     map_reduce_per_doc_chunks: int = 4   # chunks per paper in map stage
+    # Minimum top chunk score accepted as evidence for QA. The cross-encoder
+    # returns sigmoid scores in [0, 1]; fixture measurements separate an
+    # unrelated query at 0.0 from a valid generic match at 0.077.
+    qa_relevance_threshold: float = 0.05
     # llm backend:
     #   "auto"              — pick the strongest available at startup:
     #                         openai-compatible endpoint (if reachable)
@@ -101,6 +105,8 @@ class Settings(BaseSettings):
     #   "extractive"        — citation-grounded sentence synthesis, no model
     #   "hf"                — local HuggingFace model (llm_model)
     #   "openai-compatible" — Ollama / vLLM / LM Studio / OpenAI-style API
+    # auto: Ollama/OpenAI-compatible endpoint -> local HF model -> extractive.
+    # Set LLM_BACKEND=openai-compatible for Ollama, vLLM, LM Studio, etc.
     llm_backend: str = "auto"
     llm_model: str = "Qwen/Qwen2.5-7B-Instruct"        # local HF default
     llm_api_model: str = "llama3.1:8b"                 # served-model name (Ollama etc.)
