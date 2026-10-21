@@ -14,7 +14,10 @@ from rank_bm25 import BM25Okapi
 logger = logging.getLogger(__name__)
 
 _TOKEN = re.compile(r"[a-z0-9\-]+")
-_TITLE_BOOST = 2  # title tokens appear (boost+1)x
+# Title tokens appear (boost+1)x. Kept modest: a 3x title weight made
+# title word-overlap dominate, burying papers whose *abstract* is the
+# better match for the query.
+_TITLE_BOOST = 1
 
 
 def tokenize(text: str) -> list[str]:

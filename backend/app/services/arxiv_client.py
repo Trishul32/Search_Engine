@@ -19,7 +19,7 @@ import logging
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
-import requests
+import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -90,11 +90,37 @@ def parse_atom_feed(xml_text: str) -> list[PaperMeta]:
 
 
 _last_fetch_ts: float = 0.0
-_cache: dict[tuple[str, int], tuple[float, list[PaperMeta]]] = {}
+_cache: dict[tuple, tuple[float, list[PaperMeta]]] = {}
+
+
+def seconds_until_next_slot() -> float:
+    """How long until another uncached arXiv request is polite."""
+    import time as _time
+
+    return max(
+        0.0,
+        settings.arxiv_min_interval_s - (_time.monotonic() - _last_fetch_ts),
+    )
+
+
+def wait_for_slot(max_wait_s: float = 3.5) -> bool:
+    """Sleep until the throttle allows a request (bounded). Used for the
+    relaxed follow-up query, which is worth a short wait."""
+    import time as _time
+
+    wait = seconds_until_next_slot()
+    if wait > max_wait_s:
+        return False
+    if wait > 0:
+        _time.sleep(wait + 0.05)
+    return True
 
 
 def search_arxiv(
-    query: str, max_results: int | None = None
+    query: str,
+    max_results: int | None = None,
+    sort_by: str = "relevance",
+    id_list: list[str] | None = None,
 ) -> tuple[list[PaperMeta], str | None]:
     """Query the live arXiv API with a hard timeout, throttling, and caching.
 
@@ -113,7 +139,7 @@ def search_arxiv(
     import time as _time
 
     max_results = max_results or settings.arxiv_max_results
-    key = (query, max_results)
+    key = (query, max_results, sort_by, tuple(id_list or ()))
     now = _time.monotonic()
 
     hit = _cache.get(key)
@@ -131,16 +157,20 @@ def search_arxiv(
         "search_query": query,
         "start": 0,
         "max_results": max_results,
-        "sortBy": "relevance",
+        "sortBy": sort_by,
         "sortOrder": "descending",
     }
+    if id_list:
+        params["id_list"] = ",".join(id_list)
+        if not query:
+            params.pop("search_query")
     _last_fetch_ts = now
     try:
-        resp = requests.get(
+        resp = httpx.get(
             settings.arxiv_api_url,
             params=params,
             timeout=settings.arxiv_timeout_s,
-            allow_redirects=True,
+            follow_redirects=True,
             headers={"User-Agent": "arxiv-semantic-search/1.0"},
         )
         if resp.status_code in (429, 503):
@@ -155,7 +185,7 @@ def search_arxiv(
         _cache[key] = (now, metas)
         logger.info("arXiv fetch: %d entries for %r", len(metas), query)
         return metas, None
-    except requests.Timeout:
+    except httpx.TimeoutException:
         msg = f"arXiv API timed out after {settings.arxiv_timeout_s:.0f}s"
         logger.warning("%s (query=%r)", msg, query)
         return [], msg
@@ -163,6 +193,15 @@ def search_arxiv(
         msg = f"arXiv API unreachable ({type(exc).__name__})"
         logger.warning("%s: %s (query=%r)", msg, exc, query)
         return [], msg
+
+
+def fetch_by_ids(ids: list[str]) -> tuple[list[PaperMeta], str | None]:
+    """Fetch metadata for explicit arXiv ids (e.g. a pasted reading list)."""
+    ids = [i.strip() for i in ids if i and i.strip()]
+    if not ids:
+        return [], None
+    wait_for_slot()
+    return search_arxiv("", max_results=len(ids), id_list=ids)
 
 
 def upsert_papers(session: Session, metas: list[PaperMeta]) -> list[Paper]:

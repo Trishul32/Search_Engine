@@ -75,7 +75,10 @@ def test_multi_qa_diagnostics_suggest_rephrasing(pipeline):
         "compare xylophone manufacturing techniques",
         paper_ids=["2503.23013"],
     )
-    assert "none of its retrieved passages matched" in res.answer
+    # The engine now always reads the paper (abstract + best passages), so
+    # an off-topic question gets an honest "not covered" answer plus a tip,
+    # instead of an empty diagnostics message.
+    assert "does not contain" in res.answer
     assert "Tip:" in res.answer
 
 

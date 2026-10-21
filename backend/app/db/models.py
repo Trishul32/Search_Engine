@@ -93,3 +93,25 @@ class QueryLog(Base):
     sources: Mapped[str] = mapped_column(Text, default="")     # JSON list
     latency_ms: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class PaperEntities(Base):
+    """Cached knowledge-graph extraction for a paper (per extractor)."""
+    __tablename__ = "paper_entities"
+    __table_args__ = (UniqueConstraint("arxiv_id", "extractor"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    arxiv_id: Mapped[str] = mapped_column(String(64), index=True)
+    extractor: Mapped[str] = mapped_column(String(32), default="heuristic")
+    data: Mapped[str] = mapped_column(Text, default="{}")     # JSON
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class PaperCitations(Base):
+    """Cached citation data (counts, TL;DR, references) for the research map."""
+    __tablename__ = "paper_citations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    arxiv_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    data: Mapped[str] = mapped_column(Text, default="{}")     # JSON
+    fetched_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.now())

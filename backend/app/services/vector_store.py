@@ -30,9 +30,13 @@ _IVF_THRESHOLD = 50_000  # vectors; below this, exact flat search wins
 class FaissStore:
     """id-mapped FAISS index + JSON-persisted metadata, thread-safe."""
 
-    def __init__(self, name: str, dim: int, directory: Path):
+    def __init__(self, name: str, dim: int, directory: Path, signature: str = ""):
         self.name = name
         self.dim = dim
+        self.signature = signature
+        # set when a persisted index was discarded (embedder changed), so
+        # the owner can re-embed / reset dependent state
+        self.reset_reason: str | None = None
         self.dir = Path(directory)
         self.dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -60,8 +64,18 @@ class FaissStore:
                         self.name, idx.d, self.dim,
                     )
                     return
-                self.index = idx
                 raw = json.loads(self._meta_path.read_text())
+                saved_sig = raw.get("signature", "")
+                if self.signature and saved_sig != self.signature:
+                    self.reset_reason = (
+                        f"embedder changed ({saved_sig or 'unknown'} -> {self.signature})"
+                    )
+                    logger.warning(
+                        "%s index was built by a different embedder (%s); "
+                        "it will be rebuilt", self.name, self.reset_reason,
+                    )
+                    return
+                self.index = idx
                 self._meta = {int(k): v for k, v in raw["meta"].items()}
                 self._next_id = raw["next_id"]
                 logger.info("Loaded %s index (%d vectors)", self.name, self.index.ntotal)
@@ -73,6 +87,7 @@ class FaissStore:
             faiss.write_index(self.index, str(self._index_path))
             self._meta_path.write_text(
                 json.dumps({"next_id": self._next_id,
+                            "signature": self.signature,
                             "meta": {str(k): v for k, v in self._meta.items()}})
             )
 
@@ -118,6 +133,19 @@ class FaissStore:
                 if len(out) >= top_k:
                     break
             return out
+
+    def items_where(self, pred) -> list[tuple[int, dict]]:
+        """All (vector id, metadata) pairs whose metadata satisfies pred."""
+        with self._lock:
+            return [(vid, m) for vid, m in self._meta.items() if pred(m)]
+
+    def vectors(self, vids: list[int]) -> np.ndarray:
+        """Stored vectors for the given ids (exact; for small subsets such
+        as one paper's chunks, where post-filtered ANN search can miss)."""
+        with self._lock:
+            if not vids:
+                return np.zeros((0, self.dim), dtype="float32")
+            return np.vstack([self.index.reconstruct(int(v)) for v in vids]).astype("float32")
 
     def get_vector(self, vid: int) -> np.ndarray | None:
         with self._lock:

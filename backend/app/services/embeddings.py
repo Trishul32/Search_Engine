@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 class BaseEmbedder:
     dim: int
+    # Identifies the vector space. Indexes built by a different embedder
+    # (even with the same dim, e.g. hash-384 vs MiniLM-384) are rebuilt.
+    signature: str = ""
 
     def encode(self, texts: list[str]) -> np.ndarray:  # pragma: no cover
         raise NotImplementedError
@@ -35,7 +38,14 @@ class SentenceTransformerEmbedder(BaseEmbedder):
         from sentence_transformers import SentenceTransformer  # lazy import
 
         self.model = SentenceTransformer(model_name)
+        # Abstracts often exceed the 256-token default; MiniLM/BGE support
+        # 512 positions, so embed the whole abstract instead of its head.
+        try:
+            self.model.max_seq_length = max(self.model.max_seq_length or 0, 512)
+        except Exception:
+            pass
         self.dim = self.model.get_sentence_embedding_dimension()
+        self.signature = f"st:{model_name}:{self.dim}"
         logger.info("Loaded embedding model %s (dim=%d)", model_name, self.dim)
 
     def encode(self, texts: list[str]) -> np.ndarray:
@@ -59,6 +69,7 @@ class HashEmbedder(BaseEmbedder):
 
     def __init__(self, dim: int = 384):
         self.dim = dim
+        self.signature = f"hash:{dim}"
 
     @staticmethod
     def _tokens(text: str) -> list[str]:

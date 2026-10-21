@@ -35,10 +35,14 @@ class Settings(BaseSettings):
     index_dir: Path = PROJECT_ROOT / "data" / "indexes"
 
     # ------------------------------------------------------------- arXiv
-    # Live candidates pulled per query. Kept small on purpose: this is a
-    # synchronous call inside /search, and 15 fresh candidates per query
-    # accumulate quickly across searches (each also costs an embedding).
-    arxiv_max_results: int = 15
+    # Live candidates pulled per query. The live query is structured
+    # (title/abstract fields, category filters, ANDNOT exclusions), so its
+    # results are high-precision; every one is guaranteed a place in the
+    # rerank pool. 30 keeps embedding cost per search small.
+    arxiv_max_results: int = 30
+    # If the strict (all-concepts) arXiv query returns fewer than this,
+    # a relaxed (any-concept) query is issued after the polite interval.
+    arxiv_min_strict_results: int = 8
     arxiv_api_url: str = "https://arxiv.org/api/query"
     # Hard cap on the live-fetch HTTP call. Search must never hang on
     # a slow/blocked route to the arXiv API — on timeout it degrades to
@@ -71,6 +75,17 @@ class Settings(BaseSettings):
     fusion_alpha: float = 0.5            # dense weight for "weighted" fusion
     dynamic_alpha: bool = True           # per-query alpha tuning (DAT-lite)
     rrf_k: int = 60
+    # Multi-concept queries must have at least this proportion of weighted
+    # term evidence for every requested concept before a result is accepted.
+    retrieval_min_concept_coverage: float = 0.75
+    # A relevant arXiv category may modestly corroborate, but never replace,
+    # title/abstract evidence for a query concept.
+    retrieval_category_evidence_boost: float = 0.25
+    # Exclusion / field filters discard part of the candidate pool, so the
+    # pool is widened by this factor when such filters are active.
+    filtered_pool_multiplier: int = 4
+    # Upper bound on candidates scored by the cross-encoder per search.
+    max_rerank_candidates: int = 80
 
     # --------------------------------------------------------- reranking
     reranker_enabled: bool = True
@@ -114,10 +129,41 @@ class Settings(BaseSettings):
     llm_api_key: str = "not-needed"
     llm_max_new_tokens: int = 700
     llm_temperature: float = 0.2
+    # Ollama: talk to the native /api/chat endpoint. Its OpenAI-compatible
+    # endpoint silently truncates prompts to the model's default context
+    # (~2k tokens), which cut QA context in half. num_ctx fixes that.
+    llm_ollama_native: bool = True
+    llm_num_ctx: int = 4096
+    llm_keep_alive: str = "30m"          # keep the model loaded between chats
+    # generation can take minutes on CPU; streaming keeps the UI responsive
+    llm_timeout_s: float = 600.0
+    # character budgets for QA context (CPU prompt processing is ~50 tok/s)
+    qa_context_chars: int = 3600         # single paper: excerpts beyond the abstract
+    qa_multi_context_chars: int = 5200   # all papers together (single-pass compare)
+    qa_multi_single_pass_max: int = 6    # more papers than this -> map-reduce
     # Grounding guard: post-validate generated answers — strip citations
     # pointing at non-existent sources and regenerate extractively when a
     # generative answer carries no valid citations at all (unsupported).
     llm_grounding_check: bool = True
+
+    # ------------------------------------------------- query rewriting
+    # "auto": conversational queries are rewritten into academic terms by
+    # the LLM (when a generative backend is available), in parallel with
+    # the first arXiv request. "always" | "off" also accepted.
+    query_rewrite: str = "auto"
+    query_rewrite_timeout_s: float = 25.0
+
+    # ------------------------------------------------- knowledge graph
+    # Entity extraction for the paper knowledge graph:
+    #   "heuristic" — fast pattern + gazetteer extraction (default)
+    #   "llm"       — LLM JSON extraction merged with heuristics (slower,
+    #                 richer; falls back to heuristic on any failure)
+    graph_extractor: str = "heuristic"
+    graph_max_papers: int = 25
+
+    # ------------------------------------------------- reading path
+    read_next_top_k: int = 5
+    read_next_pool: int = 40             # neighbours per read paper
 
     # -------------------------------------------------------------- misc
     max_conversation_turns: int = 6      # follow-up context window (turns)

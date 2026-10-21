@@ -31,7 +31,7 @@ class HybridRetriever:
     def retrieve(
         self, pq: ProcessedQuery, top_k: int | None = None
     ) -> list[tuple[str, float]]:
-        top_k = top_k or settings.retrieval_top_k
+        top_k = top_k or pq.pool_size or settings.retrieval_top_k
         f_sparse = self._pool.submit(self.bm25.retrieve, pq.sparse_query, top_k)
         f_dense = self._pool.submit(self.dense.retrieve, pq.dense_query, top_k)
         sparse, dense = f_sparse.result(), f_dense.result()

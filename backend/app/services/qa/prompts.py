@@ -109,3 +109,39 @@ def format_contexts(items: list[dict], text_key: str = "text") -> str:
         label = it.get("label", "")
         lines.append(f"[{i}] {label}\n{it[text_key]}")
     return "\n\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Chat prompts (lean: CPU prompt processing is the latency bottleneck).
+# Layout keeps a stable prefix (system + paper header + abstract) so the
+# LLM server can reuse its cache across follow-up questions on one paper.
+# --------------------------------------------------------------------------
+SYSTEM_CHAT = (
+    "You are a precise research assistant. Answer questions about scientific "
+    "papers using ONLY the numbered excerpts you are given.\n"
+    "- Answer the question directly in the first sentence, then explain.\n"
+    "- After each factual sentence, cite the supporting excerpt number(s) in "
+    "square brackets, like [2] or [1][3]. Never invent citations, facts or numbers.\n"
+    "- If the excerpts do not answer the question, say clearly that the paper "
+    "does not discuss it, then mention what related information it does give.\n"
+    "- Use markdown: short paragraphs, bullets, and tables for comparisons. "
+    "Write about 120-250 words.\n"
+    "- Refer to 'the paper' or paper titles, never to 'excerpts' or 'context'."
+)
+
+CHAT_SINGLE_TEMPLATE = """Paper: "{title}"{byline}
+
+{contexts}
+
+{history}Question: {question}
+{instruction}
+Answer:"""
+
+CHAT_MULTI_TEMPLATE = """Papers:
+{paper_list}
+
+{contexts}
+
+{history}Question: {question}
+{instruction} Name the papers by their short titles. Cite excerpt numbers.
+Answer:"""
