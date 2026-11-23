@@ -43,7 +43,16 @@ class Settings(BaseSettings):
     # If the strict (all-concepts) arXiv query returns fewer than this,
     # a relaxed (any-concept) query is issued after the polite interval.
     arxiv_min_strict_results: int = 8
-    arxiv_api_url: str = "https://arxiv.org/api/query"
+    # The real API host. "https://arxiv.org/api/query" redirects twice
+    # (302 -> http://export... -> 301 -> https://export...), so every search
+    # cost 3 requests and hit arXiv's rate limit (HTTP 429) 3x sooner.
+    arxiv_api_url: str = "https://export.arxiv.org/api/query"
+    # After HTTP 429/503: pause live fetches (Retry-After if sent, else this,
+    # doubling on repeats up to the max) instead of retrying into the block.
+    arxiv_backoff_s: float = 60.0
+    arxiv_backoff_max_s: float = 600.0
+    # When arXiv is rate-limited or down, search arXiv papers via OpenAlex.
+    openalex_fallback: bool = True
     # Hard cap on the live-fetch HTTP call. Search must never hang on
     # a slow/blocked route to the arXiv API — on timeout it degrades to
     # the local corpus and reports why.
@@ -78,6 +87,11 @@ class Settings(BaseSettings):
     # Multi-concept queries must have at least this proportion of weighted
     # term evidence for every requested concept before a result is accepted.
     retrieval_min_concept_coverage: float = 0.75
+    # Every shown result must cover at least one query concept this well
+    # (title + abstract), so unrelated papers never pad the list. Looser
+    # when an LLM rewrite added technical vocabulary for a plain-language query.
+    retrieval_relevance_floor: float = 0.75
+    retrieval_relevance_floor_rewrite: float = 0.5
     # A relevant arXiv category may modestly corroborate, but never replace,
     # title/abstract evidence for a query concept.
     retrieval_category_evidence_boost: float = 0.25

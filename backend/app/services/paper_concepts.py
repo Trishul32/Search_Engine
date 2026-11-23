@@ -57,7 +57,7 @@ from backend.app.services.knowledge_graph import (
 
 logger = logging.getLogger(__name__)
 
-VERSION = "conceptmap-v2"
+VERSION = "conceptmap-v3"  # v3: roles relative to the paper baseline
 MAX_MAJOR = 6
 MAX_SUB = 5
 
@@ -145,8 +145,10 @@ _ROLE_CUES = {
         r"framework|model|system|contribution)|this (?:paper|work|study) (?:proposes|introduces|presents)|"
         r"novel|first to)\b", re.I),
     "evaluation": re.compile(
-        r"\b(?:evaluat\w*|experiment\w*|benchmark\w*|dataset\w*|accuracy|outperform\w*|baseline\w*|"
-        r"metric\w*|score\w*|results? (?:show|indicate)|we (?:test|measure|compare)|table \d|"
+        # "evaluat(e|ion|...)" but not "evaluator" (a component, e.g. CRAG's
+        # retrieval evaluator); bare "score" is too generic (confidence score)
+        r"\b(?:evaluat(?:e|es|ed|ing|ion|ions)|experiment\w*|benchmark\w*|dataset\w*|accuracy|"
+        r"outperform\w*|baseline\w*|metric\w*|results? (?:show|indicate)|we (?:test|measure|compare)|table \d|"
         r"participants|survey(?:ed)? \d|sample)\b", re.I),
     "background": re.compile(
         r"\b(?:prior work|previous(?:ly)?|existing|traditional(?:ly)?|conventional|widely used|"
@@ -487,28 +489,61 @@ def _paper_head(paper: dict) -> dict:
     }
 
 
+def _sentence_votes(s: dict, votes: Counter) -> None:
+    for role, pat in _ROLE_CUES.items():
+        if pat.search(s["text"]):
+            votes[role] += 1
+    sec = s["section"]
+    if sec in ("introduction", "related_work"):
+        votes["background"] += 0.5
+    elif sec == "methodology":
+        votes["method"] += 0.5
+    elif sec in ("experiments", "results"):
+        votes["evaluation"] += 0.5
+
+
+_baseline_cache: dict[int, tuple[int, dict[str, float]]] = {}
+
+
+def _role_baseline(sentences: list[dict]) -> dict[str, float]:
+    """Average per-sentence role votes over the whole paper.
+
+    Papers spend most of their text on experiments and results, so raw
+    vote counts made nearly every topic "How it's tested". A topic's role
+    is instead the one it shows MORE than the paper as a whole does.
+    """
+    hit = _baseline_cache.get(id(sentences))
+    if hit and hit[0] == len(sentences):
+        return hit[1]
+    votes: Counter = Counter()
+    body = [s for s in sentences if s["section"] != "title"]
+    for s in body:
+        _sentence_votes(s, votes)
+    n = len(body) or 1
+    base = {role: votes[role] / n for role in _ROLE_ORDER}
+    _baseline_cache.clear()
+    _baseline_cache[id(sentences)] = (len(sentences), base)
+    return base
+
+
 def _role(key: str, idxs: list[int], sentences: list[dict], kind: str | None,
           introduced: set[str], full_text: bool) -> str:
     if key in introduced or any(key in i or i in key for i in introduced if len(i) > 3):
         return "contribution"
     if kind in ("dataset", "metric"):
         return "evaluation"
+    # A topic named in the paper's title is what the paper is about.
+    if any(sentences[j]["section"] == "title" for j in idxs) and kind != "method":
+        return "concept"
     votes: Counter = Counter()
     positions = []
     for j in idxs:
         s = sentences[j]
-        for role, pat in _ROLE_CUES.items():
-            if pat.search(s["text"]):
-                votes[role] += 1
-        if s["section"] not in ("title", "abstract"):
+        if s["section"] == "title":
+            continue
+        _sentence_votes(s, votes)
+        if s["section"] != "abstract":
             positions.append(s["pos"])
-            sec = s["section"]
-            if sec in ("introduction", "related_work"):
-                votes["background"] += 0.5
-            elif sec == "methodology":
-                votes["method"] += 0.5
-            elif sec in ("experiments", "results"):
-                votes["evaluation"] += 0.5
     if full_text and positions:
         avg = sum(positions) / len(positions)
         if avg < 0.25:
@@ -517,13 +552,17 @@ def _role(key: str, idxs: list[int], sentences: list[dict], kind: str | None,
             votes["evaluation"] += 0.6
         else:
             votes["method"] += 0.4
-    n = len(idxs) or 1
+    n = len([j for j in idxs if sentences[j]["section"] != "title"]) or 1
     if votes["contribution"] / n >= 0.25:
         return "contribution"
     if not votes:
         return "concept"
-    role, v = votes.most_common(1)[0]
-    if v / n < 0.2:
+    # lift over the paper's own average, so common cues (results, tables)
+    # don't win for every topic
+    base = _role_baseline(sentences)
+    lifts = {role: votes[role] / n - base.get(role, 0.0) for role in _ROLE_ORDER if role in votes}
+    role, lift = max(lifts.items(), key=lambda kv: kv[1])
+    if lift < 0.1 or votes[role] / n < 0.2:
         return "concept"
     if kind == "method" and role == "contribution":
         return "method"

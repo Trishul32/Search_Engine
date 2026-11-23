@@ -158,7 +158,7 @@ def _concept_groups(text: str) -> list[list[str]]:
         "",
         text.strip(),
     )
-    topic = re.sub(r"(?i)\b(?:recent|latest|newest)\s+(?:papers?|research)\b", " ", topic)
+    topic = re.sub(r"(?i)\b(?:recent|latest|newest|new)\s+(?:papers?|research)\b", " ", topic)
     topic = re.sub(r"\b(?:19|20)\d{2}\b", " ", topic)
     parts = re.split(
         r"\b(?:in|for|within|across|using|and|versus|vs\.?|"
@@ -193,7 +193,12 @@ def _query_constraints(text: str) -> tuple[bool, bool, int | None, bool]:
         requires_intersection = True
     year_match = re.search(r"\b(?:19|20)\d{2}\b", text)
     requested_year = int(year_match.group()) if year_match else None
-    recent = bool(re.search(r"\b(?:recent|latest|newest)\b", text, re.I))
+    # "new papers on X" asks for recency; "new methods for X" is a topic
+    recent = bool(re.search(
+        r"\b(?:recent|latest|newest|new(?=\s+(?:papers?|research|articles?|works?|"
+        r"publications?|studies|literature)\b))\b",
+        text, re.I,
+    ))
     return requires_intersection, comparison, requested_year, recent
 
 

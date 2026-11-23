@@ -19,10 +19,15 @@ import logging
 import threading
 from pathlib import Path
 
-import faiss
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+try:
+    import faiss
+except Exception as _faiss_exc:  # e.g. native DLL blocked by OS policy
+    from . import _numpy_faiss as faiss
+    logger.warning("faiss unavailable (%s); using NumPy fallback index", _faiss_exc)
 
 _IVF_THRESHOLD = 50_000  # vectors; below this, exact flat search wins
 
@@ -59,6 +64,7 @@ class FaissStore:
             try:
                 idx = faiss.read_index(str(self._index_path))
                 if idx.d != self.dim:
+                    self.reset_reason = f"index dim {idx.d} != embedder dim {self.dim}"
                     logger.warning(
                         "%s index dim %d != embedder dim %d; rebuilding",
                         self.name, idx.d, self.dim,
@@ -80,6 +86,9 @@ class FaissStore:
                 self._next_id = raw["next_id"]
                 logger.info("Loaded %s index (%d vectors)", self.name, self.index.ntotal)
             except Exception as exc:
+                # e.g. written by a different faiss build or the NumPy fallback;
+                # owners must forget state that pointed into the lost index
+                self.reset_reason = f"unreadable index file ({type(exc).__name__})"
                 logger.warning("Failed to load %s index (%s); starting fresh", self.name, exc)
 
     def save(self) -> None:

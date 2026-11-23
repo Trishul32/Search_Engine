@@ -103,3 +103,88 @@ def test_identical_queries_served_from_cache(monkeypatch):
     assert e1 is None and e2 is None
     assert [m.arxiv_id for m in m1] == [m.arxiv_id for m in m2] == ["2503.23013"]
     assert time.perf_counter() - t0 < 2
+
+
+# ---------------------------------------------- 429 back-off + fallback
+def test_429_pauses_fetches_instead_of_retrying_into_the_block(monkeypatch):
+    from backend.app.core.config import settings
+
+    _reset_client_state(monkeypatch)
+    monkeypatch.setattr(settings, "arxiv_min_interval_s", 0.0)
+    req = httpx.Request("GET", "https://export.arxiv.org/api/query")
+    calls = {"n": 0}
+
+    def fake_get(*a, **k):
+        calls["n"] += 1
+        return httpx.Response(429, headers={"Retry-After": "120"}, request=req)
+
+    monkeypatch.setattr(ac.httpx, "get", fake_get)
+    search_arxiv("query one")
+    metas, err = search_arxiv("query two")
+    assert calls["n"] == 1, "no request may be sent while arXiv is blocking us"
+    assert metas == [] and "paused" in err and "429" in err
+    assert 100 < ac.rate_limit_remaining() <= 120, "Retry-After must be honoured"
+
+
+def test_default_api_url_has_no_redirect_hops():
+    from backend.app.core.config import Settings
+
+    # arxiv.org/api/query redirects twice, tripling requests per search
+    assert Settings().arxiv_api_url == "https://export.arxiv.org/api/query"
+
+
+def test_openalex_results_are_parsed_into_arxiv_papers(monkeypatch):
+    payload = {"results": [
+        {"doi": "https://doi.org/10.48550/arxiv.2403.16971", "title": "AIOS: LLM Agent Operating System",
+         "publication_date": "2024-03-25",
+         "authorships": [{"author": {"display_name": "Kai Mei"}}, {"author": {"display_name": "Yongfeng Zhang"}}],
+         "abstract_inverted_index": {"An": [0], "agent": [1, 4], "operating": [2], "system": [3]},
+         "locations": [{"landing_page_url": "https://arxiv.org/abs/2403.16971"}]},
+        {"doi": "https://doi.org/10.1000/not-arxiv", "title": "Journal only", "publication_date": "2020-01-01",
+         "authorships": [], "abstract_inverted_index": {"x": [0]}, "locations": []},
+    ]}
+    req = httpx.Request("GET", "https://api.openalex.org/works")
+    monkeypatch.setattr(ac.httpx, "get", lambda *a, **k: httpx.Response(200, json=payload, request=req))
+    metas, err = ac.search_openalex("operating system")
+    assert err is None and len(metas) == 1
+    m = metas[0]
+    assert m.arxiv_id == "2403.16971" and m.abstract == "An agent operating system agent"
+    assert m.authors == "Kai Mei; Yongfeng Zhang" and m.published == "2024-03-25"
+
+
+def test_rate_limited_search_falls_back_to_openalex(pipeline, monkeypatch):
+    import backend.app.services.pipeline as pl
+    from backend.app.core.config import settings
+    from backend.app.services.arxiv_client import PaperMeta
+
+    monkeypatch.setattr(settings, "openalex_fallback", True)
+    monkeypatch.setattr(pl, "search_arxiv", lambda q, max_results=None, sort_by="relevance":
+                        ([], "arXiv API rate-limited this computer (HTTP 429); live fetch paused for 60s"))
+    fresh = PaperMeta(arxiv_id="2403.16971", title="AIOS: LLM Agent Operating System",
+                      abstract="AIOS is an operating system that embeds large language models "
+                               "into operating system kernels for agents.",
+                      published="2024-03-25", pdf_url="")
+    seen = {}
+
+    def fake_openalex(text, **kw):
+        seen["text"] = text
+        return [fresh], None
+
+    monkeypatch.setattr(pl, "search_openalex", fake_openalex)
+    out = pipeline.search("operating system", fetch_arxiv=True)
+    assert seen["text"] == "operating system"
+    assert "2403.16971" in [r["arxiv_id"] for r in out["results"]]
+    assert "OpenAlex" in out["notice"] and "429" in out["notice"]
+
+
+def test_openalex_category_backfill_when_arxiv_returns_paper(pipeline):
+    from backend.app.db.models import Paper
+    from backend.app.db.session import db_session
+    from backend.app.services.arxiv_client import PaperMeta
+    from sqlalchemy import select
+
+    pipeline.ingest_metadata([PaperMeta(arxiv_id="2401.00001", title="T", abstract="A", categories="")])
+    pipeline.ingest_metadata([PaperMeta(arxiv_id="2401.00001", title="T", abstract="A", categories="cs.OS")])
+    with db_session() as s:
+        cats = s.execute(select(Paper.categories).where(Paper.arxiv_id == "2401.00001")).scalar_one()
+    assert cats == "cs.OS"

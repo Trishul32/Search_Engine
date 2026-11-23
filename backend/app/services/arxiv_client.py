@@ -16,6 +16,7 @@ pipeline can report to the user.
 from __future__ import annotations
 
 import logging
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
@@ -91,6 +92,33 @@ def parse_atom_feed(xml_text: str) -> list[PaperMeta]:
 
 _last_fetch_ts: float = 0.0
 _cache: dict[tuple, tuple[float, list[PaperMeta]]] = {}
+# rate-limit back-off: no arXiv request before this monotonic time
+_blocked_until: float = 0.0
+_strikes: int = 0
+
+
+def rate_limit_remaining() -> float:
+    """Seconds left in the back-off after an arXiv 429/503 (0 = not blocked)."""
+    import time as _time
+
+    return max(0.0, _blocked_until - _time.monotonic())
+
+
+def _start_backoff(resp: httpx.Response) -> float:
+    """Pause live fetches after a 429/503. Retrying into a block only
+    extends it, so honour Retry-After, else back off exponentially."""
+    global _blocked_until, _strikes
+    import time as _time
+
+    try:
+        wait = float(resp.headers.get("Retry-After", ""))
+    except ValueError:
+        wait = 0.0
+    if wait <= 0:
+        wait = min(settings.arxiv_backoff_s * (2 ** _strikes), settings.arxiv_backoff_max_s)
+    _strikes += 1
+    _blocked_until = _time.monotonic() + wait
+    return wait
 
 
 def seconds_until_next_slot() -> float:
@@ -135,7 +163,7 @@ def search_arxiv(
       are skipped with an explanatory reason instead of risking a 429;
     * HTTP 429/503 responses are reported explicitly as rate limiting.
     """
-    global _last_fetch_ts
+    global _last_fetch_ts, _strikes
     import time as _time
 
     max_results = max_results or settings.arxiv_max_results
@@ -146,6 +174,12 @@ def search_arxiv(
     if hit and now - hit[0] < settings.arxiv_cache_ttl_s:
         logger.info("arXiv fetch served from cache for %r", query)
         return hit[1], None
+
+    if now < _blocked_until:
+        return [], (
+            "arXiv API rate-limited this computer (HTTP 429); live fetch paused "
+            f"for {int(_blocked_until - now) + 1}s so the block is not extended"
+        )
 
     if now - _last_fetch_ts < settings.arxiv_min_interval_s:
         return [], (
@@ -174,13 +208,15 @@ def search_arxiv(
             headers={"User-Agent": "arxiv-semantic-search/1.0"},
         )
         if resp.status_code in (429, 503):
+            wait = _start_backoff(resp)
             msg = (
-                f"arXiv API rate-limited (HTTP {resp.status_code}) — "
-                "wait a minute before fetching again"
+                f"arXiv API rate-limited this computer (HTTP {resp.status_code}); "
+                f"live fetch paused for {int(wait)}s so the block is not extended"
             )
             logger.warning("%s (query=%r)", msg, query)
             return [], msg
         resp.raise_for_status()
+        _strikes = 0
         metas = parse_atom_feed(resp.text)
         _cache[key] = (now, metas)
         logger.info("arXiv fetch: %d entries for %r", len(metas), query)
@@ -204,6 +240,83 @@ def fetch_by_ids(ids: list[str]) -> tuple[list[PaperMeta], str | None]:
     return search_arxiv("", max_results=len(ids), id_list=ids)
 
 
+# ------------------------------------------------------- OpenAlex fallback
+_OPENALEX_WORKS = "https://api.openalex.org/works"
+_OPENALEX_ARXIV_SOURCE = "S4306400194"          # "arXiv (Cornell University)"
+_ARXIV_ID_IN_URL = re.compile(r"arxiv\.(?:org/abs/)?(\d{4}\.\d{4,5})", re.I)
+
+
+def _openalex_abstract(inverted: dict | None) -> str:
+    """OpenAlex ships abstracts as {word: [positions]}; rebuild the text."""
+    if not inverted:
+        return ""
+    slots: dict[int, str] = {}
+    for word, positions in inverted.items():
+        for pos in positions:
+            slots[pos] = word
+    return " ".join(slots[i] for i in sorted(slots))
+
+
+def search_openalex(
+    text: str,
+    max_results: int | None = None,
+    newest_first: bool = False,
+    year: int | None = None,
+) -> tuple[list[PaperMeta], str | None]:
+    """Search arXiv papers through OpenAlex's index of arXiv.
+
+    Used only when the arXiv API itself is rate-limiting or unreachable, so
+    a search still returns fresh, on-topic arXiv papers instead of falling
+    back to the small local collection. OpenAlex has no arXiv categories,
+    so callers with field filters should not rely on it.
+    """
+    if not text.strip():
+        return [], None
+    max_results = max_results or settings.arxiv_max_results
+    filters = [f"title_and_abstract.search:{text.replace(',', ' ')}",
+               f"locations.source.id:{_OPENALEX_ARXIV_SOURCE}"]
+    if year:
+        filters.append(f"publication_year:{year}")
+    try:
+        resp = httpx.get(
+            _OPENALEX_WORKS,
+            params={
+                "filter": ",".join(filters),
+                "sort": "publication_date:desc" if newest_first else "relevance_score:desc",
+                "per-page": min(max_results, 50),
+                "select": "doi,title,publication_date,authorships,abstract_inverted_index,locations",
+            },
+            timeout=settings.arxiv_timeout_s,
+            headers={"User-Agent": "arxiv-semantic-search/1.0"},
+        )
+        resp.raise_for_status()
+    except Exception as exc:  # the fallback must never break search either
+        msg = f"OpenAlex fallback unavailable ({type(exc).__name__})"
+        logger.warning("%s: %s", msg, exc)
+        return [], msg
+    metas: list[PaperMeta] = []
+    seen: set[str] = set()
+    for w in resp.json().get("results", []):
+        urls = [loc.get("landing_page_url") or "" for loc in w.get("locations") or []]
+        urls.append(w.get("doi") or "")
+        ids = _ARXIV_ID_IN_URL.findall(" ".join(urls))
+        abstract = _openalex_abstract(w.get("abstract_inverted_index"))
+        if not ids or not w.get("title") or not abstract or ids[0] in seen:
+            continue
+        aid = ids[0]
+        seen.add(aid)
+        authors = "; ".join(
+            (a.get("author") or {}).get("display_name", "") for a in w.get("authorships") or []
+        )
+        metas.append(PaperMeta(
+            arxiv_id=aid, title=_squash(w["title"]), abstract=_squash(abstract),
+            authors=authors, categories="", published=w.get("publication_date") or "",
+            pdf_url=f"https://arxiv.org/pdf/{aid}",
+        ))
+    logger.info("OpenAlex fallback: %d arXiv papers for %r", len(metas), text)
+    return metas, None
+
+
 def upsert_papers(session: Session, metas: list[PaperMeta]) -> list[Paper]:
     """Insert new papers; skip ones already indexed (dedup on arxiv_id)."""
     papers: list[Paper] = []
@@ -214,6 +327,10 @@ def upsert_papers(session: Session, metas: list[PaperMeta]) -> list[Paper]:
             select(Paper).where(Paper.arxiv_id == m.arxiv_id)
         ).scalar_one_or_none()
         if existing:
+            # papers first stored from the OpenAlex fallback have no arXiv
+            # categories; fill them in when arXiv itself returns the paper
+            if m.categories and not existing.categories:
+                existing.categories = m.categories
             papers.append(existing)
             continue
         p = Paper(

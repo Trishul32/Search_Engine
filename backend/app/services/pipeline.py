@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -27,6 +28,7 @@ from backend.app.db.session import db_session, init_db
 from backend.app.services.arxiv_client import (
     PaperMeta,
     search_arxiv,
+    search_openalex,
     upsert_papers,
     wait_for_slot,
 )
@@ -68,7 +70,11 @@ class SearchPipeline:
         sig = self.embedder.signature
         self.paper_store = FaissStore("papers", self.embedder.dim, settings.index_dir, signature=sig)
         self.chunk_store = FaissStore("chunks", self.embedder.dim, settings.index_dir, signature=sig)
-        if self.chunk_store.reset_reason:
+        # An empty chunk index (discarded, unreadable or deleted) while the DB
+        # still marks papers "embedded" would make QA answer from abstracts
+        # forever, because indexing is skipped for "embedded" papers. Reset so
+        # they are lazily re-chunked (the PDFs themselves stay cached).
+        if self.chunk_store.reset_reason or self.chunk_store.ntotal == 0:
             self._reset_chunk_state()
         self.bm25 = BM25Retriever()
         self.dense = DenseRetriever(self.paper_store, self.embedder)
@@ -134,7 +140,7 @@ class SearchPipeline:
                 p.pdf_status = "none"
                 p.n_chunks = 0
         self.chunk_store.save()
-        logger.info("Chunk index reset (%s)", self.chunk_store.reset_reason)
+        logger.info("Chunk index reset (%s)", self.chunk_store.reset_reason or "chunk index empty")
 
     # ------------------------------------------------------------- ingest
     def ingest_metadata(self, metas) -> int:
@@ -225,12 +231,13 @@ class SearchPipeline:
         #    fields, category filters, ANDNOT exclusions), metadata only.
         t_fetch = 0.0
         fetch_error: str | None = None
+        fallback_reason: str | None = None
         live_ids: list[str] = []
         live_queries: list[str] = []
         metas: list[PaperMeta] = []
         tf = time.perf_counter()
         if fetch_arxiv:
-            metas, fetch_error, live_queries = self._fetch_live(
+            metas, fetch_error, live_queries, fallback_reason = self._fetch_live(
                 pq, thin_ok=rewrite_job is not None
             )
         if rewrite_job is not None:
@@ -284,7 +291,12 @@ class SearchPipeline:
         latency = (time.perf_counter() - t0) * 1000
         self._log(session_id, "search", query, "", [r["arxiv_id"] for r in ranked], latency)
         notice = None
-        if fetch_error:
+        if fallback_reason:
+            notice = (
+                f"{fallback_reason}. New arXiv papers were "
+                "fetched from OpenAlex's index of arXiv instead (it can lag arXiv by a few days)."
+            )
+        elif fetch_error:
             notice = f"Live arXiv fetch skipped — {fetch_error}. "
             notice += (
                 "The local corpus is empty, so there is nothing to search yet: "
@@ -305,7 +317,12 @@ class SearchPipeline:
                 "exclusions, so none are shown. Try a more specific topic."
             )
         elif not ranked:
-            notice = "No papers in the available corpus matched the query evidence."
+            looked_for = ", ".join(f"“{' '.join(c)}”" for c in pq.concepts) or "your topic"
+            notice = (
+                f"No papers {'on arXiv or ' if fetch_arxiv else ''}in the local "
+                f"collection mention {looked_for}. "
+                "Check the spelling, or try broader or different words."
+            )
         return {
             "notice": notice,
             "query": pq.normalized,
@@ -385,18 +402,28 @@ class SearchPipeline:
 
     def _fetch_live(
         self, pq: ProcessedQuery, thin_ok: bool = False
-    ) -> tuple[list[PaperMeta], str | None, list[str]]:
+    ) -> tuple[list[PaperMeta], str | None, list[str], str | None]:
         """Strict structured arXiv query, plus a relaxed one if it is thin.
 
         Strict = every concept must appear in the title or abstract.
         Relaxed = any concept may appear (arXiv's relevance sort still puts
         papers matching more concepts first). Both keep field filters and
         exclusions, so the live results never reintroduce excluded topics.
+
+        Returns (metas, error, queries, fallback_reason): when arXiv is
+        rate-limiting or unreachable, arXiv papers are fetched from OpenAlex
+        instead and fallback_reason says why.
         """
         strict = build_arxiv_query(pq)
         if not strict:
-            return [], None, []
-        sort_by = "submittedDate" if pq.browse_only else "relevance"
+            return [], None, [], None
+        # "latest / new papers on X": ask arXiv for the newest matches (the
+        # strict query still requires X in the title/abstract)
+        sort_by = "submittedDate" if (pq.browse_only or pq.recent) else "relevance"
+        # A search right after another one used to SKIP the live fetch
+        # (throttle) and silently fall back to the small local corpus. Wait
+        # for the polite slot instead (at most ~3s).
+        wait_for_slot()
         metas, error = (
             search_arxiv(strict) if sort_by == "relevance"
             else search_arxiv(strict, sort_by=sort_by)
@@ -410,13 +437,25 @@ class SearchPipeline:
         ):
             relaxed = build_arxiv_query(pq, relaxed=True)
             if relaxed and relaxed != strict and wait_for_slot():
-                more, error2 = search_arxiv(relaxed)
+                more, error2 = (
+                    search_arxiv(relaxed) if sort_by == "relevance"
+                    else search_arxiv(relaxed, sort_by=sort_by)
+                )
                 queries.append(relaxed)
                 seen = {m.arxiv_id for m in metas}
                 metas = metas + [m for m in more if m.arxiv_id not in seen]
                 if error2 and not metas:
                     error = error2
-        return metas, error, queries
+        # arXiv rate-limited / down: get fresh arXiv papers via OpenAlex rather
+        # than silently searching only the small local collection. (Skipped
+        # for field filters: OpenAlex has no arXiv categories to filter on.)
+        if error and not metas and settings.openalex_fallback and not pq.fields and pq.concepts:
+            text = " ".join(" ".join(c) for c in pq.concepts)
+            fallback, _ = search_openalex(
+                text, newest_first=pq.recent or pq.browse_only, year=pq.requested_year)
+            if fallback:
+                return fallback, None, queries + [f"OpenAlex (arXiv papers): {text}"], error
+        return metas, error, queries, None
 
     def _browse_ids(self, pq: ProcessedQuery, limit: int = 300) -> list[str]:
         """Local papers in the requested fields (topic-less field browse)."""
@@ -512,6 +551,22 @@ class SearchPipeline:
                 >= settings.retrieval_min_concept_coverage
             ]
 
+        # Relevance floor: never pad results with papers that do not mention
+        # the topic. Before this, "heart attack" returned graph-neural-network
+        # papers (0% of the query words) and "diffusion models" returned
+        # language-model papers (matching only the generic word "models").
+        # At least one concept must be well covered by title + abstract.
+        # With an LLM rewrite, papers arXiv matched on the rewritten technical
+        # wording are kept: they legitimately use different words.
+        if pq.concepts:
+            floor = (settings.retrieval_relevance_floor if pq.rewrite is None
+                     else settings.retrieval_relevance_floor_rewrite)
+            ranked = [
+                candidate for candidate in ranked
+                if max(candidate["concept_coverage"]["coverage"] or [1.0]) >= floor
+                or (pq.rewrite is not None and candidate.get("live_rank") is not None)
+            ]
+
         rerank_rank = {
             candidate["arxiv_id"]: rank
             for rank, candidate in enumerate(ranked)
@@ -561,6 +616,17 @@ class SearchPipeline:
                 key=lambda candidate: str(candidate.get("published", "")),
                 reverse=True,
             )
+            if pq.recent and pq.concepts:
+                # Newest-first must not let papers that merely contain the
+                # words apart ("heart" ... "attack") beat papers about the
+                # actual phrase ("heart attack"). Exact-phrase matches first,
+                # each group newest-first (the sort above is stable).
+                phrases = [" ".join(c).lower() for c in pq.concepts if len(c) > 1]
+                if phrases:
+                    def has_phrase(c: dict) -> bool:
+                        text = re.sub(r"[\s\-]+", " ", f"{c.get('title', '')} {c.get('abstract', '')}".lower())
+                        return any(p in text for p in phrases)
+                    ranked.sort(key=lambda c: not has_phrase(c))
         return ranked[:top_k]
 
     @staticmethod

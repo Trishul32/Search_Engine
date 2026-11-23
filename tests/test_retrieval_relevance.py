@@ -136,7 +136,40 @@ def test_document_evidence_improves_single_concept_ranking(pipeline, monkeypatch
     )
 
     assert ranked[0]["arxiv_id"] == "9901.00011"
-    assert ranked[0]["final_relevance_score"] > ranked[1]["final_relevance_score"]
+    # the quantum-database paper mentions neither "computer" nor "networking":
+    # the relevance floor removes it instead of padding the results with it
+    assert [r["arxiv_id"] for r in ranked] == ["9901.00011"]
+
+
+def test_unrelated_papers_are_not_shown_as_padding(pipeline, monkeypatch):
+    """A typo'd or uncovered topic returns nothing rather than unrelated papers."""
+    from backend.app.services.arxiv_client import PaperMeta
+    from backend.app.services.query_processor import process_query
+
+    papers = [
+        PaperMeta(arxiv_id="9901.00020", title="Binary Graph Neural Networks",
+                  abstract="We binarize graph neural networks for efficient inference.",
+                  categories="cs.LG"),
+        PaperMeta(arxiv_id="9901.00021", title="Scaling Language Models",
+                  abstract="Large language models improve with scale.", categories="cs.CL"),
+    ]
+    pipeline.ingest_metadata(papers)
+    monkeypatch.setattr(pipeline.hybrid, "retrieve",
+                        lambda _pq: [(p.arxiv_id, 1.0) for p in papers])
+    monkeypatch.setattr(pipeline.reranker, "rerank",
+                        lambda _q, c, top_k: [{**x, "rerank_score": 0.3} for x in c][:top_k])
+
+    assert pipeline._retrieve_and_rerank(process_query("give me paper on heart attackl"), 5) == []
+    # only the generic word "models" matches: still not a diffusion-model paper
+    assert pipeline._retrieve_and_rerank(process_query("diffusion models"), 5) == []
+
+
+def test_new_papers_means_recent_but_new_methods_is_a_topic():
+    from backend.app.services.query_processor import process_query
+
+    assert process_query("new papers on diffusion models").recent
+    assert process_query("latest research on heart attack").recent
+    assert not process_query("new methods for graph coloring").recent
 
 
 def test_deep_learning_intrusion_query_requires_both_concepts(pipeline, monkeypatch):

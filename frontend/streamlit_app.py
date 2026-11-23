@@ -423,6 +423,15 @@ with tab_search:
             st.session_state.last_search = data
             st.session_state["_url_query_done"] = query
             st.query_params["q"] = query
+            # A new search moves every paper tab onto its results. Before,
+            # Research Map / Chat / Compare / Similar kept showing the paper
+            # from an earlier session (e.g. CRAG after searching "nuclear theory").
+            new_ids = [r["arxiv_id"] for r in data["results"]]
+            if new_ids:
+                st.session_state.active_paper = new_ids[0]    # Chat
+                st.session_state.concept_pick = new_ids[0]    # Research Map
+                st.session_state.rec_paper = new_ids[0]       # Similar
+                st.session_state.compare_ids = new_ids[:2]    # Compare: top two
 
     data = st.session_state.last_search
     terms: list[str] = []
@@ -452,7 +461,7 @@ with tab_search:
                 if col.button(topic, key=f"topic_{topic}"):
                     st.session_state.pending_query = f"{topic} in {field_name} {excl}".strip()
                     st.rerun()
-        if not data["results"]:
+        if not data["results"] and not data.get("notice"):
             st.info("No papers matched. Try a broader query.")
         rw = interp.get("rewrite")
         terms = " ".join(interp.get("concepts", []) + [interp.get("topic") or ""]).split()
@@ -487,9 +496,13 @@ with tab_search:
             queued = r["arxiv_id"] in st.session_state.compare_ids
             if c2.button("⚖️ Added" if queued else "⚖️ Compare", key=f"cmp_{r['arxiv_id']}",
                          disabled=queued, **STRETCH):
-                st.session_state.compare_ids.append(r["arxiv_id"])
-                st.toast("Added to Compare")
-                st.rerun()
+                if len(st.session_state.compare_ids) >= 6:
+                    st.toast("Compare holds up to 6 papers. Remove one first.")
+                else:
+                    # new list object, so the Compare tab sees the change
+                    st.session_state.compare_ids = st.session_state.compare_ids + [r["arxiv_id"]]
+                    st.toast(f"Added to Compare ({len(st.session_state.compare_ids)} selected)")
+                    st.rerun()
             if c3.button("✨ Similar", key=f"rec_{r['arxiv_id']}", **STRETCH):
                 st.session_state.rec_paper = r["arxiv_id"]
                 st.toast("Opened in the Similar tab")
@@ -512,19 +525,29 @@ with tab_map:
             st.info("No papers yet. Run a search first.")
         else:
             ids = list(_cat)
-            active = st.session_state.get("active_paper")
+            # The search handler moves this picker to the newest search's top
+            # result; otherwise keep the user's pick (if it still exists).
+            if st.session_state.get("concept_pick") not in ids:
+                st.session_state.concept_pick = ids[0]
             c1, c2 = st.columns([3, 1])
             map_paper = c1.selectbox(
-                "Paper", ids, index=ids.index(active) if active in ids else 0,
-                format_func=lambda i: paper_label(_cat[i]), key="concept_pick",
+                "Paper", ids, format_func=lambda i: paper_label(_cat[i]), key="concept_pick",
             )
             explain = c2.toggle("Explain simply", value=False)
-            if st.button("Build concept map", type="primary"):
+            built = st.session_state.get("concept_map") or {}
+            # A map belongs to one paper: build it for the selected paper
+            # automatically (fast without "Explain simply"), and never show
+            # a map that was built for a different paper.
+            stale = built.get("arxiv_id") != map_paper
+            clicked = st.button("Build concept map" if stale else "Rebuild concept map", type="primary")
+            if clicked or (stale and not explain):
                 with st.spinner("Building…"):
-                    st.session_state.concept_map = api_post(
+                    data = api_post(
                         f"/papers/{map_paper}/concept-map?explain={'true' if explain else 'false'}", {},
                         timeout=900)
-            cm = st.session_state.get("concept_map")
+                st.session_state.concept_map = {"arxiv_id": map_paper, "data": data} if data else None
+                built = st.session_state.concept_map or {}
+            cm = built.get("data") if built.get("arxiv_id") == map_paper else None
             if cm:
                 if cm.get("notice"):
                     st.info(cm["notice"])
@@ -664,11 +687,18 @@ with tab_single:
         st.info("No papers yet. Run a search first.")
     else:
         ids = list(catalog)
-        if st.session_state.get("single_pick") not in ids or (active and st.session_state.get("single_pick") != active):
-            st.session_state.single_pick = active if active in ids else ids[0]
+        # active_paper is changed from outside (new search, 💬 Chat buttons).
+        # Apply it only when it changed since this tab last wrote it; the old
+        # check (pick != active) also fired on the user's own new pick, so
+        # choosing another paper here snapped back to the previous one.
+        if active in ids and st.session_state.get("_chat_synced") != active:
+            st.session_state.single_pick = active
+        elif st.session_state.get("single_pick") not in ids:
+            st.session_state.single_pick = ids[0]
         paper_id = st.selectbox("Paper", ids, format_func=lambda i: paper_label(catalog[i]),
                                 key="single_pick")
         st.session_state.active_paper = paper_id
+        st.session_state._chat_synced = paper_id
         p = catalog[paper_id]
         # index the PDF as soon as a paper is picked, so the first answer is faster
         if st.session_state.get("indexed_paper") != paper_id:
@@ -698,13 +728,24 @@ with tab_single:
 # ----------------------------------------------------------------- Compare
 with tab_multi:
     catalog = paper_catalog()
-    if "multi_pick" not in st.session_state or set(st.session_state.multi_pick) != set(st.session_state.compare_ids):
+    # compare_ids can change outside this widget (the ⚖️ Compare buttons on
+    # search results, the sidebar Clear). Push it into the widget only when
+    # it has changed since the widget last wrote it. Otherwise the user's
+    # fresh pick (already in multi_pick) would be overwritten by the stale
+    # list on every rerun, and nothing would ever stay selected.
+    if st.session_state.get("_multi_synced") != st.session_state.compare_ids:
         st.session_state.multi_pick = [i for i in st.session_state.compare_ids if i in catalog][:6]
+    elif "multi_pick" in st.session_state:
+        # drop picks that are no longer offered (an invalid value breaks the widget)
+        st.session_state.multi_pick = [i for i in st.session_state.multi_pick if i in catalog]
     chosen = st.multiselect(
         "Papers (up to 6)", list(catalog), max_selections=6,
         format_func=lambda i: paper_label(catalog[i], 80), key="multi_pick",
     )
     st.session_state.compare_ids = list(chosen)
+    st.session_state._multi_synced = list(chosen)
+    if len(chosen) == 1:
+        st.info("Add at least one more paper to compare.")
     chat_key = ",".join(sorted(chosen)) or "auto"
     history = st.session_state.multi_chat.setdefault(chat_key, [])
     if history and st.button("New chat", key="clear_multi"):
@@ -723,12 +764,26 @@ with tab_recs:
     catalog = paper_catalog()
     if catalog:
         ids = list(catalog)
-        rec_default = st.session_state.get("rec_paper")
-        rid = st.selectbox("Paper", ids, index=ids.index(rec_default) if rec_default in ids else 0,
-                           format_func=lambda i: paper_label(catalog[i]), key="rec_pick")
-        if st.button("Find similar", type="primary"):
-            st.session_state.rec_results = api_get(f"/papers/{rid}/recommendations?top_k=8")
-        recs = st.session_state.get("rec_results")
+        # rec_paper is set by a new search or a "✨ Similar" button; apply it
+        # to the picker (index= is ignored once the widget has a value).
+        # (applied only when it changed since this tab last wrote it, so the
+        # user's own pick in the dropdown is not reverted)
+        rec_target = st.session_state.get("rec_paper")
+        if rec_target in ids and st.session_state.get("_rec_synced") != rec_target:
+            st.session_state.rec_pick = rec_target
+        elif st.session_state.get("rec_pick") not in ids:
+            st.session_state.rec_pick = ids[0]
+        rid = st.selectbox("Paper", ids, format_func=lambda i: paper_label(catalog[i]), key="rec_pick")
+        st.session_state.rec_paper = rid
+        st.session_state._rec_synced = rid
+        # Suggestions belong to one paper: fetch them for the selected paper
+        # (a fast call) and never show another paper's list.
+        prev = st.session_state.get("rec_results") or {}
+        if st.button("Refresh", type="primary") or prev.get("arxiv_id") != rid:
+            data = api_get(f"/papers/{rid}/recommendations?top_k=8")
+            st.session_state.rec_results = {"arxiv_id": rid, "data": data} if data else None
+            prev = st.session_state.rec_results or {}
+        recs = prev.get("data") if prev.get("arxiv_id") == rid else None
         if recs:
             for rec in recs["recommendations"]:
                 closeness = (("Very similar", "") if rec["score"] >= 0.75 else

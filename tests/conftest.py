@@ -19,6 +19,16 @@ os.environ.setdefault("ARXIV_MIN_INTERVAL_S", "0")   # no throttling inside test
 os.environ.setdefault("RERANKER_ENABLED", "true")
 os.environ.setdefault("CORRECTIVE_RETRIEVAL", "false")
 os.environ.setdefault("LOG_LEVEL", "WARNING")
+os.environ.setdefault("OPENALEX_FALLBACK", "false")  # offline: enabled per-test with a mock
+
+
+@pytest.fixture(autouse=True)
+def _reset_arxiv_backoff(monkeypatch):
+    """A 429 in one test must not pause arXiv fetches in the next one."""
+    import backend.app.services.arxiv_client as ac
+
+    monkeypatch.setattr(ac, "_blocked_until", 0.0)
+    monkeypatch.setattr(ac, "_strikes", 0)
 
 
 @pytest.fixture(scope="session", autouse=True)
